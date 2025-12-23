@@ -1,4 +1,4 @@
-name: Terraform Drift Detection (Production Only)
+name: Terraform Drift Detection
 
 on:
   schedule:
@@ -6,7 +6,8 @@ on:
   workflow_dispatch: # Allows manual triggering
   push:
     branches:
-      - main  # Only run on production (main branch)
+      - main  # Production
+      - dev   # Development
 
 permissions:
   contents: read
@@ -28,6 +29,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Determine Environment
+        id: env-vars
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+          fi
+          echo "Detecting drift for: $ENVIRONMENT environment"
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -43,8 +56,8 @@ jobs:
 
       - name: Terraform Init
         run: |
-          # Initialize with production backend configuration
-          terraform init -backend-config="backend-prod.hcl"
+          # Initialize with environment-specific backend configuration
+          terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
 
       - name: Terraform Plan (Drift Detection)
         id: plan
@@ -87,8 +100,9 @@ jobs:
               labels: 'drift-detection'
             });
 
+            const env = '${{ env.ENVIRONMENT }}';
             const existingIssue = issues.data.find(issue => 
-              issue.title.includes('Terraform Drift Detected')
+              issue.title.includes(`Terraform Drift Detected [${env}]`)
             );
 
             if (existingIssue) {
@@ -102,9 +116,9 @@ jobs:
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: '🚨 Terraform Drift Detected',
+                title: `🚨 Terraform Drift Detected [${env}]`,
                 body: body,
-                labels: ['drift-detection', 'auto-fix']
+                labels: ['drift-detection', 'auto-fix', env]
               });
             }
 
