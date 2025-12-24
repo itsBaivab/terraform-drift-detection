@@ -679,6 +679,999 @@ terraform destroy
 
 ---
 
+## Detailed Workflow Architecture & Internals
+
+This section provides an in-depth technical breakdown of how each workflow operates, what happens behind the scenes, and how all the components work together.
+
+---
+
+### System Architecture Overview
+
+```
+GitHub Repository (Code)
+         ↓
+    GitHub Actions (CI/CD)
+         ↓
+    ┌────────────────────────────────────┐
+    │                                    │
+    ↓                                    ↓
+AWS Resources                   S3 State Backend
+(VPC, ALB, EC2, etc.)           (Source of Truth)
+    ↑                                    │
+    └────────────────────────────────────┘
+         State Sync & Locking
+```
+
+**Key Components:**
+1. **GitHub Repository:** Source code and Terraform configurations
+2. **GitHub Actions:** Automation engine running workflows
+3. **S3 Backend:** Centralized state storage with locking
+4. **AWS Resources:** Actual infrastructure being managed
+5. **GitHub Issues:** Drift tracking and audit trail
+6. **Slack (optional):** Real-time notifications
+
+---
+
+### Workflow 1: CI/CD Pipeline - Deep Dive
+
+**File:** `.github/workflows/terraform.yml`
+
+#### Architecture: Two-Job Sequential Workflow
+
+```
+terraform-plan (Job 1)
+    │
+    ├─ Runs on: ubuntu-latest
+    ├─ Duration: ~2-3 minutes
+    ├─ Output: tfplan artifact
+    └─ Always runs
+         │
+         ↓
+terraform-apply (Job 2)
+    │
+    ├─ Runs on: ubuntu-latest  (new VM)
+    ├─ Duration: ~5-10 minutes
+    ├─ Input: tfplan artifact
+    └─ Only on push events
+```
+
+---
+
+#### Job 1: Plan - Step-by-Step Technical Breakdown
+
+**Step 1: Checkout Repository**
+```yaml
+- name: Checkout
+  uses: actions/checkout@v4
+```
+**Technical details:**
+- Uses GitHub's checkout action (v4)
+- Clones entire repository to `/home/runner/work/terraform-drift-detection/`
+- Fetches full git history (useful for drift tracking)
+- Sets up git credentials for potential future commits
+
+**Step 2: Determine Environment**
+```yaml
+if [[ "${{ github.ref_name }}" == "main" ]]; then
+  echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+else
+  echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+fi
+```
+**What happens:**
+- `github.ref_name` contains the branch name
+- Sets `ENVIRONMENT` environment variable for all subsequent steps
+- Drives backend config selection and resource naming
+- Available to all steps as `${{ env.ENVIRONMENT }}`
+
+**Step 3: Configure AWS Credentials**
+```yaml
+- uses: aws-actions/configure-aws-credentials@v2
+```
+**Behind the scenes:**
+- Reads secrets from GitHub's encrypted secrets store
+- Sets environment variables:
+  - `AWS_ACCESS_KEY_ID`
+  - `AWS_SECRET_ACCESS_KEY`
+  - `AWS_DEFAULT_REGION`
+- Creates AWS credential file at `~/.aws/credentials`
+- Validates credentials with STS GetCallerIdentity API call
+- If validation fails, workflow terminates immediately
+
+**Step 4: Setup Terraform**
+```yaml
+- uses: hashicorp/setup-terraform@v2
+  with:
+    terraform_version: 1.10.3
+    terraform_wrapper: false
+```
+**What it installs:**
+- Downloads Terraform 1.10.3 binary from releases.hashicorp.com
+- Extracts to `/usr/local/bin/terraform`
+- Verifies checksum for security
+- `terraform_wrapper: false` prevents wrapper script (cleaner output)
+- Adds terraform to PATH
+
+**Step 5: Terraform Init**
+```yaml
+terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+```
+**Detailed initialization process:**
+
+1. **Read backend configuration:**
+   ```hcl
+   # backend-dev.hcl
+   bucket       = "techtutorialswithpiyush-terraform-state"
+   key          = "dev/terraform.tfstate"
+   region       = "us-east-1"
+   use_lockfile = true
+   encrypt      = true
+   ```
+
+2. **Connect to S3:**
+   - Validates bucket exists and is accessible
+   - Checks IAM permissions (s3:GetObject, s3:PutObject)
+   - Enables server-side encryption (AES-256)
+
+3. **Download state file:**
+   - Fetches `dev/terraform.tfstate` from S3
+   - Loads into memory as current state
+   - If doesn't exist, initializes empty state
+
+4. **Download providers:**
+   - Reads `required_providers` from terraform block
+   - Downloads AWS provider (~400MB) to `.terraform/providers/`
+   - Downloads Random provider (~10MB)
+   - Caches providers for future runs
+
+5. **Create lock file:**
+   - Generates `.terraform.lock.hcl` with provider versions
+   - Ensures consistent provider versions across runs
+
+**Step 6-7: Format Check & Validate**
+```yaml
+terraform fmt -check
+terraform validate
+```
+**Format check:**
+- Scans all `*.tf` files
+- Compares against canonical formatting rules
+- Reports files needing formatting
+- `continue-on-error: true` allows workflow to continue
+
+**Validate:**
+- Parses all Terraform configuration
+- Checks syntax errors
+- Validates resource references
+- Ensures required variables defined
+- Does NOT check provider credentials
+
+**Step 8: Terraform Plan**
+```yaml
+terraform plan -no-color -out=tfplan | tee plan_output.txt
+```
+**Plan generation process:**
+
+1. **Load current state:**
+   - Reads state file from memory (downloaded during init)
+   - Contains IDs of all managed resources
+
+2. **Refresh (implicit):**
+   - Queries AWS APIs for current resource attributes
+   - Updates state with latest values
+   - Detects manual changes made outside Terraform
+
+3. **Read configuration:**
+   - Parses all `.tf` files in current directory
+   - Builds dependency graph
+   - Resolves variable values
+
+4. **Calculate diff:**
+   - Compares desired state (config) vs current state (S3/AWS)
+   - Generates list of operations needed
+
+5. **Create execution plan:**
+   - Determines order of operations (respects dependencies)
+   - Saves to binary file: `tfplan`
+   - Generates human-readable output
+
+**Example plan output:**
+```terraform
+Terraform will perform the following actions:
+
+  # aws_instance.web[0] will be created
+  + resource "aws_instance" "web" {
+      + ami           = "ami-12345678"
+      + instance_type = "t2.micro"
+      + tags          = {
+          + "Environment" = "dev"
+        }
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+**Step 9: Comment on PR** (PRs only)
+```yaml
+uses: actions/github-script@v6
+```
+**What happens:**
+- Reads `plan_output.txt`
+- Truncates if > 65,000 characters (GitHub limit)
+- Formats as markdown code block
+- Posts as PR comment via GitHub API
+- Updates existing comment if already posted
+- Allows reviewers to see infrastructure changes before merge
+
+**Step 10: Upload Plan Artifact**
+```yaml
+uses: actions/upload-artifact@v4
+if: steps.plan.outcome == 'success'
+with:
+  name: tfplan-${{ env.ENVIRONMENT }}
+  path: tfplan
+  retention-days: 5
+  if-no-files-found: warn
+```
+**Artifact upload process:**
+- **Compression:** gzip the `tfplan` file (~100KB → ~10KB)
+- **Upload:** POST to GitHub's artifact storage API
+- **Storage:** GitHub stores in Azure Blob Storage
+- **Naming:** `tfplan-dev` or `tfplan-prod`
+- **Expiration:** Auto-deleted after 5 days
+- **Conditional:** Only if plan succeeded and file exists
+
+---
+
+#### Job 2: Apply - Step-by-Step Technical Breakdown
+
+**Dependency & Condition:**
+```yaml
+needs: terraform-plan
+if: github.event_name == 'push' && needs.terraform-plan.result == 'success'
+```
+- Waits for Plan job to complete
+- Only runs on direct pushes (not PRs)
+- Skips if Plan failed
+- Runs on fresh VM (no filesystem sharing with Job 1)
+
+**Steps 1-5: Setup** (Same as Plan job)
+- Fresh checkout of code
+- Environment determination
+- AWS authentication
+- Terraform installation
+- Backend initialization & state download
+
+**Step 6: Download Plan Artifact**
+```yaml
+uses: actions/download-artifact@v4
+continue-on-error: true
+id: download
+with:
+  name: tfplan-${{ env.ENVIRONMENT }}
+```
+**Download process:**
+- **API call:** GET from GitHub artifact storage
+- **Decompress:** Unzip the artifact
+- **Save:** Places `tfplan` in current directory
+- **Graceful failure:** If artifact doesn't exist (no changes), continues
+- **Why might not exist?** Second push with identical code
+
+**Step 7: Check if Plan Exists**
+```yaml
+if [ -f "tfplan" ]; then
+  echo "plan_exists=true" >> $GITHUB_OUTPUT
+else
+  echo "plan_exists=false" >> $GITHUB_OUTPUT
+fi
+```
+**File system check:**
+- Tests if `tfplan` file exists in working directory
+- Sets output variable for conditional execution
+- Prevents "file not found" errors in apply step
+
+**Step 8: Terraform Apply** (conditional)
+```yaml
+if: steps.check-plan.outputs.plan_exists == 'true'
+terraform apply -auto-approve tfplan
+```
+**Apply execution process:**
+
+1. **Read plan file:**
+   - Loads binary `tfplan`
+   - Contains exact operations to perform
+   - Includes all resolved values
+
+2. **Acquire state lock:**
+   - Creates `dev/terraform.tfstate.tflock` in S3
+   - Lock contains:
+     ```json
+     {
+       "ID": "a1b2c3d4-...",
+       "Operation": "OperationTypeApply",
+       "Info": "github-actions",
+       "Who": "github-runner@ubuntu",
+       "Created": "2025-12-24T10:30:00Z",
+       "Path": "dev/terraform.tfstate"
+     }
+     ```
+   - Prevents concurrent modifications
+
+3. **Execute operations:**
+   - Creates resources in dependency order
+   - Makes AWS API calls for each resource
+   - Examples:
+     - `ec2:RunInstances` for EC2
+     - `elasticloadbalancing:CreateLoadBalancer` for ALB
+     - `ec2:CreateVpc` for VPC
+
+4. **Update state file:**
+   - After each resource creation, updates state
+   - Records resource IDs, ARNs, attributes
+   - Example state entry:
+     ```json
+     {
+       "mode": "managed",
+       "type": "aws_instance",
+       "name": "web",
+       "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+       "instances": [{
+         "attributes": {
+           "id": "i-0123456789abcdef",
+           "ami": "ami-12345678",
+           "instance_type": "t2.micro",
+           "public_ip": "54.123.45.67"
+         }
+       }]
+     }
+     ```
+
+5. **Upload state to S3:**
+   - Backs up current state: `terraform.tfstate` → `terraform.tfstate.backup`
+   - Uploads new state to `terraform.tfstate`
+   - Uses S3's PutObject with server-side encryption
+
+6. **Release lock:**
+   - Deletes `.tflock` file from S3
+   - Allows other operations to proceed
+
+**Step 9: Output Infrastructure Info**
+```yaml
+terraform output >> $GITHUB_STEP_SUMMARY
+```
+- Reads outputs defined in `outputs.tf`
+- Formats as GitHub Actions summary
+- Visible in workflow run UI
+- Examples: ALB DNS, VPC ID, subnet IDs
+
+---
+
+### Workflow 2: Drift Detection - Deep Dive
+
+**File:** `.github/workflows/drift_detection.yml`
+
+#### Single-Job Architecture with Conditional Logic
+
+```
+drift-detection (Single Job)
+    │
+    ├─ Trigger: Schedule (daily 8am UTC)
+    ├─ Trigger: Manual
+    ├─ Trigger: Push to main/dev
+    │
+    ├─ terraform plan -detailed-exitcode
+    │   └─ Captures exit code (0, 1, or 2)
+    │
+    ├─ If exit code 2 (drift):
+    │   ├─ Create/update GitHub issue
+    │   ├─ terraform apply -auto-approve
+    │   ├─ Send Slack notification
+    │   └─ Close issue on success
+    │
+    └─ If exit code 0 (no drift):
+        └─ Close any open drift issues
+```
+
+---
+
+#### Detailed Step Analysis
+
+**Step 1-5: Standard Setup**
+- Checkout, environment detection, AWS config, Terraform setup, init
+- Same as CI/CD workflow
+
+**Step 6: Drift Detection Plan**
+```yaml
+set +e
+terraform plan -detailed-exitcode -no-color > plan_output.txt 2>&1
+EXIT_CODE=$?
+echo "exitcode=$EXIT_CODE" >> $GITHUB_OUTPUT
+cat plan_output.txt
+exit 0
+```
+
+**Understanding Exit Codes:**
+- **Exit Code 0:** ✅ No drift - infrastructure perfectly matches code
+- **Exit Code 1:** ❌ Error - syntax error, API failure, etc.
+- **Exit Code 2:** ⚠️ Drift detected - infrastructure differs from code
+
+**Why `set +e`?**
+- Bash normally exits on non-zero return codes
+- Exit code 2 isn't an error in our context
+- `set +e` disables immediate exit
+- Allows capturing exit code in `$?`
+
+**Why `exit 0`?**
+- Ensures step always succeeds
+- Workflow continues to remediation logic
+- Without this, GitHub Actions would mark step as failed
+
+**What drift detection catches:**
+- Manual AWS Console changes
+- CLI/SDK modifications
+- Changes by other automation
+- Accidental deletions
+- Configuration drift over time
+
+**Example drift scenarios:**
+
+1. **Tag modification:**
+   ```
+   # Plan shows
+   ~ resource "aws_instance" "web" {
+       ~ tags = {
+           ~ "Environment" = "dev" -> "development"  # Changed manually
+         }
+     }
+   ```
+
+2. **Security group rule added:**
+   ```
+   ~ resource "aws_security_group" "alb" {
+       ~ ingress {
+           + cidr_blocks = ["0.0.0.0/0"]  # Unauthorized SSH access
+           + from_port   = 22
+           + to_port     = 22
+         }
+     }
+   ```
+
+**Step 7: Analyze Drift** (if exitcode == 2)
+```yaml
+uses: actions/github-script@v6
+```
+
+**Issue creation/update logic:**
+```javascript
+// Search for existing drift issues
+const issues = await github.rest.issues.listForRepo({
+  state: 'open',
+  labels: 'drift-detection'
+});
+
+// Find environment-specific issue
+const existingIssue = issues.data.find(issue => 
+  issue.title.includes(`[${env}]`)
+);
+
+if (existingIssue) {
+  // Update existing issue with new drift info
+  await github.rest.issues.createComment({
+    issue_number: existingIssue.number,
+    body: `## New Drift Detected\n\n${planOutput}`
+  });
+} else {
+  // Create new issue
+  await github.rest.issues.create({
+    title: `🚨 Terraform Drift Detected [${env}]`,
+    body: driftDetails,
+    labels: ['drift-detection', 'auto-fix', env]
+  });
+}
+```
+
+**Issue content includes:**
+- Timestamp of detection
+- Environment (dev/prod)
+- Full terraform plan showing changes
+- Link to workflow run
+- Auto-fix status
+
+**Step 8: Auto-Fix Drift** (if exitcode == 2)
+```yaml
+terraform apply -auto-approve -no-color > apply_output.txt 2>&1
+continue-on-error: true
+```
+
+**Auto-remediation process:**
+1. Reads current drift plan
+2. Acquires state lock
+3. Applies changes to restore desired state
+4. Examples:
+   - Removes unauthorized tags
+   - Reverts security group changes
+   - Restores original configurations
+   - Recreates deleted resources
+5. Updates state file
+6. Releases lock
+
+**Safety considerations:**
+- Only fixes detected drift
+- Doesn't create new resources (unless previously deleted)
+- Maintains exact configuration from code
+- All changes logged in workflow output
+
+**Step 9-10: Slack Notifications**
+
+**Success notification:**
+```json
+{
+  "text": "✅ Terraform Drift Auto-Fixed",
+  "blocks": [{
+    "type": "header",
+    "text": "✅ Drift Detected & Automatically Fixed"
+  }, {
+    "type": "section",
+    "text": "*Repository:* terraform-drift-detection\n*Environment:* dev\n*Link:* <workflow-url>"
+  }]
+}
+```
+
+**Failure notification:**
+```json
+{
+  "text": "❌ Terraform Drift Auto-Fix Failed",
+  "blocks": [{
+    "type": "header",
+    "text": "❌ Manual Intervention Required"
+  }]
+}
+```
+
+**Step 11: Update/Close Issues**
+
+**On successful fix:**
+- Posts comment: "✅ Drift remediated"
+- Closes issue
+- Updates labels
+
+**On no drift (exitcode == 0):**
+- Finds all open drift issues for environment
+- Posts: "✅ No drift detected. Infrastructure in sync"
+- Closes all related issues
+- Keeps issue board clean
+
+---
+
+### Workflow 3: Destroy - Deep Dive
+
+**File:** `.github/workflows/destroy.yml`
+
+#### Safety-First Architecture
+
+```
+destroy-infrastructure (Single Job)
+    │
+    ├─ Manual trigger only
+    ├─ Requires:
+    │   ├─ Environment selection (dev/prod)
+    │   └─ Confirmation: "DESTROY"
+    │
+    ├─ terraform plan -destroy
+    │   └─ Shows what will be destroyed
+    │
+    ├─ Create tracking issue
+    │
+    ├─ terraform destroy -auto-approve
+    │   └─ Destroys all resources
+    │
+    └─ Update issue with results
+```
+
+---
+
+#### Safety Mechanisms in Detail
+
+**1. Manual Trigger Only**
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, prod]
+      confirmation:
+        type: string
+        required: true
+```
+- No automatic triggers
+- Must navigate to Actions tab
+- Click "Run workflow"
+- Fill in required inputs
+- Deliberate multi-step process
+
+**2. Confirmation String Validation**
+```yaml
+if: inputs.confirmation == 'DESTROY'
+```
+- Case-sensitive match
+- Must type exactly "DESTROY"
+- Typos prevent execution
+- Similar to AWS Console deletions
+
+**3. Environment Approval Gates** (if configured)
+```yaml
+environment: ${{ inputs.environment }}
+```
+- Can require manual approval for prod
+- Designated reviewers notified
+- Optional wait timer
+- Approval history tracked
+
+**4. Tracking Issue**
+```yaml
+await github.rest.issues.create({
+  title: '🗑️ Infrastructure Destruction - ${env}',
+  body: `Initiated by: @${context.actor}\nTimestamp: ${timestamp}\nEnvironment: ${env}`,
+  labels: ['infrastructure', 'destruction', env]
+});
+```
+- Creates audit trail
+- Records who initiated
+- Documents what was destroyed
+- Permanent record
+
+---
+
+#### Destruction Process
+
+**Step 6: Destroy Plan**
+```yaml
+terraform plan -destroy -no-color
+```
+- Shows all resources to be destroyed
+- Final opportunity to review
+- No actual destruction yet
+- Output includes:
+  - List of all resources
+  - Dependencies
+  - Destruction order
+
+**Step 7: Execute Destroy**
+```yaml
+terraform destroy -auto-approve -no-color
+```
+
+**Destruction sequence (managed by Terraform):**
+
+1. **EC2 Instances:**
+   - Terminates all instances in ASG
+   - Waits for termination (~30 seconds)
+
+2. **Auto Scaling Group:**
+   - Sets desired capacity to 0
+   - Deletes ASG configuration
+
+3. **Load Balancer:**
+   - Deregisters targets
+   - Deletes listeners
+   - Deletes ALB (~2 minutes)
+
+4. **Target Groups:**
+   - Removes target registrations
+   - Deletes target groups
+
+5. **NAT Gateway:**
+   - Deletes NAT Gateway
+   - **Takes 3-5 minutes** (AWS limitation)
+   - Releases Elastic IP
+
+6. **Internet Gateway:**
+   - Detaches from VPC
+   - Deletes IGW
+
+7. **Subnets:**
+   - Ensures no dependencies
+   - Deletes public/private subnets
+
+8. **Route Tables:**
+   - Removes routes
+   - Disassociates from subnets
+   - Deletes route tables
+
+9. **VPC:**
+   - Final dependency check
+   - Deletes VPC
+
+10. **Security Groups:**
+    - Removes ingress/egress rules
+    - Deletes security groups
+
+11. **S3 Buckets** (if managed):
+    - Must be empty first
+    - Deletes bucket
+
+**State file updates:**
+- Each deleted resource removed from state
+- State file still exists in S3 (for audit)
+- Can be used to recreate infrastructure
+
+**Step 8: Update Tracking Issue**
+```yaml
+await github.rest.issues.createComment({
+  body: '✅ Infrastructure successfully destroyed'
+});
+await github.rest.issues.update({
+  state: 'closed'
+});
+```
+
+---
+
+### Key Concepts: State Management Deep Dive
+
+#### S3 Backend Architecture
+
+```
+S3 Bucket: techtutorialswithpiyush-terraform-state
+│
+├── dev/
+│   ├── terraform.tfstate          # Current state (JSON)
+│   ├── terraform.tfstate.backup   # Previous version
+│   └── terraform.tfstate.tflock   # Lock file (temporary)
+│
+└── prod/
+    ├── terraform.tfstate
+    ├── terraform.tfstate.backup
+    └── terraform.tfstate.tflock
+```
+
+#### State File Contents (Example)
+
+```json
+{
+  "version": 4,
+  "terraform_version": "1.10.3",
+  "serial": 42,
+  "lineage": "a1b2c3d4-e5f6-...",
+  "outputs": {
+    "alb_dns_name": {
+      "value": "dev-alb-1234567890.us-east-1.elb.amazonaws.com"
+    }
+  },
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_vpc",
+      "name": "main",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [{
+        "schema_version": 1,
+        "attributes": {
+          "id": "vpc-0123456789abcdef",
+          "cidr_block": "10.0.0.0/16",
+          "enable_dns_hostnames": true,
+          "tags": {
+            "Name": "dev-vpc",
+            "Environment": "dev"
+          }
+        }
+      }]
+    }
+  ]
+}
+```
+
+#### State Locking Flow
+
+```
+Workflow A: terraform apply
+│
+├─ Step 1: Check for lock file
+│   └─ s3://bucket/dev/terraform.tfstate.tflock exists?
+│       ├─ YES → Fail with "State locked" error
+│       └─ NO → Continue
+│
+├─ Step 2: Create lock file
+│   └─ PUT s3://bucket/dev/terraform.tfstate.tflock
+│       Content: { "ID": "abc123", "Who": "github-actions", ... }
+│
+├─ Step 3: Perform operations
+│   ├─ Modify infrastructure
+│   └─ Update state file
+│
+└─ Step 4: Release lock
+    └─ DELETE s3://bucket/dev/terraform.tfstate.tflock
+```
+
+**Concurrent workflow handling:**
+```
+Time: 10:00:00 - Workflow A starts
+Time: 10:00:01 - Workflow A acquires lock
+Time: 10:00:15 - Workflow B starts
+Time: 10:00:16 - Workflow B tries to acquire lock
+Time: 10:00:16 - Workflow B fails: "State is locked by Workflow A"
+Time: 10:05:30 - Workflow A completes, releases lock
+Time: 10:05:31 - Workflow B can now be re-run successfully
+```
+
+---
+
+### Troubleshooting Guide
+
+#### Common Issues & Solutions
+
+**1. "Artifact not found"**
+```
+Error: Unable to download artifact(s): Artifact not found for name: tfplan-dev
+```
+**Cause:** Infrastructure unchanged, no plan artifact created  
+**Solution:** Workflow now handles gracefully, shows "No changes to apply"  
+**State file:** Always accessible in S3, unaffected by artifact issues
+
+**2. "State is locked"**
+```
+Error: Error acquiring the state lock
+Lock Info:
+  ID:        a1b2c3d4-e5f6-...
+  Operation: OperationTypeApply
+  Who:       github-actions@ubuntu
+```
+**Cause:** Another workflow or local run in progress  
+**Solution:**
+- Wait for other operation to complete
+- Check running workflows in Actions tab
+- Emergency unlock (only if certain):
+  ```bash
+  aws s3 rm s3://techtutorialswithpiyush-terraform-state/dev/terraform.tfstate.tflock
+  ```
+
+**3. "Exit code 2" marked as failure**
+```
+Error: Process completed with exit code 2.
+```
+**Cause:** Exit code 2 = drift detected (not an error!)  
+**Solution:** Workflow now captures exit code properly with `set +e` and `exit 0`
+
+**4. "Backend configuration changed"**
+```
+Error: Backend configuration changed
+```
+**Cause:** S3 bucket name or key changed  
+**Solution:**
+```bash
+terraform init -reconfigure -backend-config="backend-dev.hcl"
+```
+
+---
+
+### Monitoring & Observability
+
+#### GitHub Actions Interface
+
+**Workflow Run Page:**
+- Real-time log streaming
+- Step-by-step execution status
+- Timing information per step
+- Artifact download links
+- Re-run capabilities
+
+**Annotations:**
+- Error messages highlighted
+- Warning indicators
+- Line numbers for failures
+
+**Summary Page:**
+- Infrastructure outputs
+- Deployment status
+- Links to created issues
+- Environment information
+
+#### GitHub Issues
+
+**Drift Detection Issues:**
+- Created automatically on drift
+- Tagged with environment label
+- Contains full plan output
+- Updated with remediation status
+- Closed automatically when fixed
+
+**Destruction Tracking:**
+- Created on destroy workflow trigger
+- Records initiator and timestamp
+- Documents destroyed resources
+- Permanent audit trail
+
+#### Slack Integration
+
+**Message Format:**
+```
+✅ Terraform Drift Auto-Fixed
+━━━━━━━━━━━━━━━━━━━━━━━━
+Repository: terraform-drift-detection
+Branch: main
+Environment: prod
+Workflow: <clickable link>
+━━━━━━━━━━━━━━━━━━━━━━━━
+Terraform automatically applied changes to remediate infrastructure drift.
+```
+
+#### S3 State Versioning
+
+**View all versions:**
+```bash
+aws s3api list-object-versions \
+  --bucket techtutorialswithpiyush-terraform-state \
+  --prefix dev/terraform.tfstate
+```
+
+**Output:**
+```json
+{
+  "Versions": [
+    {
+      "Key": "dev/terraform.tfstate",
+      "VersionId": "abc123...",
+      "LastModified": "2025-12-24T10:30:00Z",
+      "Size": 45678
+    },
+    {
+      "Key": "dev/terraform.tfstate",
+      "VersionId": "def456...",
+      "LastModified": "2025-12-24T09:00:00Z",
+      "Size": 44123
+    }
+  ]
+}
+```
+
+**Rollback to previous version:**
+```bash
+aws s3api get-object \
+  --bucket techtutorialswithpiyush-terraform-state \
+  --key dev/terraform.tfstate \
+  --version-id def456... \
+  terraform.tfstate.backup
+```
+
+---
+
+### Security Considerations
+
+#### Secrets Management
+- **Storage:** GitHub encrypts secrets at rest
+- **Access:** Only available to workflows, never logged
+- **Rotation:** Update in Settings → Secrets without code changes
+- **Scope:** Repository-level (could be organization-level)
+
+#### IAM Permissions Required
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "ec2:*",
+      "elasticloadbalancing:*",
+      "autoscaling:*",
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+#### State File Security
+- **Encryption:** AES-256 server-side encryption
+- **Access:** IAM-controlled, audit with CloudTrail
+- **Versioning:** Enabled for rollback and audit
+- **Locking:** Prevents corruption from concurrent access
+
+---
+
 ## Advanced Topics
 
 ### Remote State Management
