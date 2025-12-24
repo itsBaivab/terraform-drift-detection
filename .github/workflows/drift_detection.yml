@@ -62,11 +62,15 @@ jobs:
       - name: Terraform Plan (Drift Detection)
         id: plan
         run: |
+          set +e  # Don't exit on error
           terraform plan -detailed-exitcode -no-color > plan_output.txt 2>&1
-        continue-on-error: true
+          EXIT_CODE=$?
+          echo "exitcode=$EXIT_CODE" >> $GITHUB_OUTPUT
+          cat plan_output.txt
+          exit 0  # Always succeed so workflow continues
 
       - name: Analyze Drift
-        if: steps.plan.outputs.exitcode == 2
+        if: steps.plan.outputs.exitcode == '2'
         uses: actions/github-script@v6
         env:
           PLAN_OUTPUT: plan_output.txt
@@ -123,7 +127,7 @@ jobs:
             }
 
       - name: Auto-Fix Drift
-        if: steps.plan.outputs.exitcode == 2
+        if: steps.plan.outputs.exitcode == '2'
         id: apply
         run: |
           echo "Applying Terraform changes to fix drift..."
@@ -131,7 +135,7 @@ jobs:
         continue-on-error: true
 
       - name: Notify Slack - Drift Detected & Fixed
-        if: steps.plan.outputs.exitcode == 2 && steps.apply.outcome == 'success'
+        if: steps.plan.outputs.exitcode == '2' && steps.apply.outcome == 'success'
         run: |
           curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
           -H 'Content-Type: application/json' \
@@ -163,7 +167,7 @@ jobs:
           }'
 
       - name: Notify Slack - Auto-Fix Failed
-        if: steps.plan.outputs.exitcode == 2 && steps.apply.outcome == 'failure'
+        if: steps.plan.outputs.exitcode == '2' && steps.apply.outcome == 'failure'
         run: |
           curl -X POST ${{ env.SLACK_WEBHOOK_URL }} \
           -H 'Content-Type: application/json' \
@@ -188,7 +192,7 @@ jobs:
           }'
 
       - name: Update Issue on Success
-        if: steps.plan.outputs.exitcode == 2 && steps.apply.outcome == 'success'
+        if: steps.plan.outputs.exitcode == '2' && steps.apply.outcome == 'success'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -217,14 +221,14 @@ jobs:
             }
 
       - name: Publish Drift Summary
-        if: steps.plan.outputs.exitcode == 2
+        if: steps.plan.outputs.exitcode == '2'
         run: |
           echo "### 🚨 Drift Detected & Auto-Fixed" >> $GITHUB_STEP_SUMMARY
           echo "Terraform has detected and automatically fixed infrastructure drift." >> $GITHUB_STEP_SUMMARY
           echo "Check the [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." >> $GITHUB_STEP_SUMMARY
 
       - name: Close Old Drift Issues
-        if: steps.plan.outputs.exitcode == 0
+        if: steps.plan.outputs.exitcode == '0'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -253,14 +257,14 @@ jobs:
             }
 
       - name: No Drift
-        if: steps.plan.outputs.exitcode == 0
+        if: steps.plan.outputs.exitcode == '0'
         run: |
           echo "No drift detected. Infrastructure is in sync."
           echo "### ✅ No Drift Detected" >> $GITHUB_STEP_SUMMARY
           echo "Infrastructure is in sync with the configuration." >> $GITHUB_STEP_SUMMARY
 
       - name: Terraform Plan Failure
-        if: steps.plan.outputs.exitcode == 1
+        if: steps.plan.outputs.exitcode == '1'
         run: |
           echo "::error::Terraform plan failed."
           exit 1
