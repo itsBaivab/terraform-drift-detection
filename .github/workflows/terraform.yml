@@ -65,7 +65,7 @@ jobs:
       - name: Terraform Init
         run: |
           # Initialize with environment-specific backend configuration
-          terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+          terraform init -reconfigure -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
 
       - name: Terraform Format Check
         id: fmt
