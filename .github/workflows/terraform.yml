@@ -120,16 +120,18 @@ jobs:
         run: exit 1
 
       - name: Upload Plan
+        if: steps.plan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ env.ENVIRONMENT }}
           path: tfplan
           retention-days: 5
+          if-no-files-found: warn
 
   terraform-apply:
     name: "Terraform Apply"
     needs: terraform-plan
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.terraform-plan.result == 'success'
     runs-on: ubuntu-latest
     environment: ${{ needs.terraform-plan.outputs.environment }}
 
@@ -167,15 +169,35 @@ jobs:
 
       - name: Download Plan
         uses: actions/download-artifact@v4
+        continue-on-error: true
+        id: download
         with:
           name: tfplan-${{ env.ENVIRONMENT }}
 
+      - name: Check if Plan Exists
+        id: check-plan
+        run: |
+          if [ -f "tfplan" ]; then
+            echo "plan_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "plan_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No plan file found - infrastructure may already be up to date"
+          fi
+
       - name: Terraform Apply
+        if: steps.check-plan.outputs.plan_exists == 'true'
         run: |
           echo "Applying Terraform changes for $ENVIRONMENT environment..."
           terraform apply -auto-approve tfplan
 
+      - name: No Changes to Apply
+        if: steps.check-plan.outputs.plan_exists == 'false'
+        run: |
+          echo "### ℹ️ No Changes to Apply" >> $GITHUB_STEP_SUMMARY
+          echo "Infrastructure is already up to date. No plan file was generated." >> $GITHUB_STEP_SUMMARY
+
       - name: Output Infrastructure Info
+        if: steps.check-plan.outputs.plan_exists == 'true'
         run: |
           echo "### 🚀 Infrastructure Deployed Successfully" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
