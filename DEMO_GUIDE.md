@@ -76,15 +76,15 @@ This demo creates a complete web application infrastructure:
 
 | Environment | Branch | Purpose | Drift Detection |
 |-------------|--------|---------|-----------------|
-| **Dev** | `dev` | Development/testing | ❌ Disabled |
-| **Prod** | `main` | Production | ✅ Enabled (daily + auto-fix) |
+| **Dev** | `dev` | Development/testing | ⚠️ Manual trigger only |
+| **Prod** | `main` | Production | ✅ Enabled (every 1 min + auto-fix) |
 
 ### Workflows
 
 | Workflow | File | Trigger | Purpose |
 |----------|------|---------|---------|
 | **CI/CD** | `terraform.yml` | Push to main/dev | Deploy infrastructure |
-| **Drift Detection** | `drift_detection.yml` | Daily schedule (prod only) | Detect & auto-fix drift |
+| **Drift Detection** | `drift_detection.yml` | Every 1 minute (prod only) + Manual | Detect & auto-fix drift |
 | **Destroy** | `destroy.yml` | Manual trigger | Safely destroy infrastructure |
 
 ---
@@ -384,11 +384,10 @@ dev branch  → dev environment
 ### Workflow 2: Drift Detection (`drift_detection.yml`)
 
 **Triggers:**
-- **Scheduled:** Every 1 minute (automatic)
-- **Manual:** Via GitHub Actions UI
-- **Push:** On push to `main` or `dev` branches
+- **Scheduled:** Every 1 minute (automatic, prod only)
+- **Manual:** Via GitHub Actions UI (both dev and prod)
 
-**Runs on both dev and prod environments!**
+**Important:** Scheduled runs only execute on the default branch (main/prod). Dev environment requires manual trigger.
 
 **Flow:**
 ```
