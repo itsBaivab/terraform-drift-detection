@@ -343,7 +343,7 @@ main branch → prod environment
 dev branch  → dev environment
 ```
 
-### Workflow 2: Drift Detection (`drift_detection.yml`)
+### Workflow 2: Drift Detection (`drift_detection.yml` )
 
 **Triggers:**
 - Daily schedule: 8 AM UTC

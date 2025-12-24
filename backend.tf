@@ -7,7 +7,7 @@ terraform {
   backend "s3" {
     # Backend configuration will be provided via backend config file or CLI
     # This allows different state files for dev and prod environments
-    
+
     # Configuration values provided at init time:
     # bucket        = "terraform-state-bucket-name"
     # key           = "env/terraform.tfstate"  # Will be dev or prod

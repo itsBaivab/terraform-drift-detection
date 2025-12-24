@@ -3,8 +3,8 @@ name: "Terraform CI/CD"
 on:
   push:
     branches:
-      - main  # Production
-      - dev   # Development
+      - main # Production
+      - dev # Development
   pull_request:
     branches:
       - main
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.env-vars.outputs.environment }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -38,7 +38,7 @@ jobs:
           else
             BRANCH_NAME="${{ github.ref_name }}"
           fi
-          
+
           if [[ "$BRANCH_NAME" == "main" ]]; then
             echo "environment=prod" >> $GITHUB_OUTPUT
             echo "ENVIRONMENT=prod" >> $GITHUB_ENV
@@ -46,7 +46,7 @@ jobs:
             echo "environment=dev" >> $GITHUB_OUTPUT
             echo "ENVIRONMENT=dev" >> $GITHUB_ENV
           fi
-          
+
           echo "Deploying to: $ENVIRONMENT"
 
       - name: Configure AWS Credentials
@@ -90,22 +90,22 @@ jobs:
           script: |
             const fs = require('fs');
             const planOutput = fs.readFileSync('plan_output.txt', 'utf8');
-            
+
             const output = `#### Terraform Plan for \`${{ env.ENVIRONMENT }}\` Environment 🌍
-            
+
             <details>
             <summary>Show Plan</summary>
-            
+
             \`\`\`terraform
             ${planOutput.slice(0, 60000)}
             \`\`\`
-            
+
             </details>
-            
+
             - **Format:** \`${{ steps.fmt.outcome }}\`
             - **Validate:** \`${{ steps.validate.outcome }}\`
             - **Plan:** \`${{ steps.plan.outcome }}\`
-            
+
             *Pushed by: @${{ github.actor }}*`;
 
             github.rest.issues.createComment({
@@ -132,7 +132,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: ${{ needs.terraform-plan.outputs.environment }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v3

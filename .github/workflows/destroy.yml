@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment to destroy (dev or prod)'
+        description: "Environment to destroy (dev or prod)"
         required: true
         type: choice
         options:
@@ -28,7 +28,7 @@ jobs:
     name: "Destroy ${{ inputs.environment }} Infrastructure"
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,30 +100,30 @@ jobs:
             } catch (e) {
               destroyOutput = 'No output captured';
             }
-            
+
             const success = '${{ steps.destroy.outcome }}' === 'success';
             const title = success 
               ? '✅ Infrastructure Destroyed: ${{ inputs.environment }}'
               : '❌ Infrastructure Destroy Failed: ${{ inputs.environment }}';
-            
+
             const body = `### Infrastructure Destruction Report
-            
+
             **Environment:** \`${{ inputs.environment }}\`
             **Status:** ${success ? '✅ Success' : '❌ Failed'}
             **Triggered by:** @${{ github.actor }}
             **Workflow Run:** [View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            
+
             <details>
             <summary>Destroy Output</summary>
-            
+
             \`\`\`
             ${destroyOutput.slice(0, 60000)}
             \`\`\`
-            
+
             </details>
-            
+
             ${success ? '✅ All resources have been successfully destroyed.' : '⚠️ Some resources may not have been destroyed. Please review the logs and clean up manually if needed.'}`;
-            
+
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -141,7 +141,7 @@ jobs:
             echo "Slack webhook not configured, skipping notification"
             exit 0
           fi
-          
+
           STATUS="${{ steps.destroy.outcome }}"
           if [ "$STATUS" = "success" ]; then
             EMOJI="✅"
@@ -150,7 +150,7 @@ jobs:
             EMOJI="❌"
             STATUS_TEXT="Destroy Failed"
           fi
-          
+
           curl -X POST $SLACK_WEBHOOK_URL \
           -H 'Content-Type: application/json' \
           -d "{
