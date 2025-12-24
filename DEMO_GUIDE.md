@@ -289,29 +289,67 @@ aws ec2 terminate-instances --instance-ids i-xxxxx
 - Drift detection may not catch this (depends on timing)
 - Good test of ASG self-healing
 
-### Test Scenario 3: Security Group Rule Change
+### Test Scenario 3: Security Group Rule Change (Recommended for Demo)
 
+**Simulate unauthorized SSH access by adding a security group rule:**
+
+**Step 1: Get your security group ID**
 ```bash
-# Add unauthorized ingress rule
+# Find the ALB security group
+aws ec2 describe-security-groups \
+  --filters "Name=tag:Name,Values=*alb*" \
+  --query "SecurityGroups[0].GroupId" \
+  --output text
+```
+
+**Step 2: Add unauthorized SSH rule**
+```bash
+# Add dangerous SSH rule allowing access from anywhere
 aws ec2 authorize-security-group-ingress \
   --group-id sg-xxxxx \
   --protocol tcp \
   --port 22 \
-  --cidr 0.0.0.0/0
+  --cidr 0.0.0.0/0 \
+  --description "Unauthorized SSH access"
 ```
 
-**What happens:**
-- Drift detection identifies unauthorized SSH rule
-- Auto-remediation removes the rule
-- Issue tracks the change
+**Or via AWS Console:**
+1. EC2 → Security Groups
+2. Find your ALB security group (e.g., `dev-alb-sg`)
+3. Inbound rules → Edit inbound rules
+4. Add rule:
+   - **Type:** SSH
+   - **Protocol:** TCP
+   - **Port:** 22
+   - **Source:** 0.0.0.0/0 (Anywhere IPv4)
+   - **Description:** Unauthorized SSH access
+5. Save rules
+
+**What happens next:**
+1. **Within 1 minute:** Drift detection workflow runs automatically
+2. **Detection:** Identifies the unauthorized SSH rule
+3. **GitHub Issue:** Creates issue `🚨 Terraform Drift Detected [dev]`
+4. **Auto-Remediation:** Automatically removes the dangerous SSH rule
+5. **Slack Alert:** Sends notification (if configured)
+6. **Issue Closed:** Marks drift as remediated
+
+**Why this is the best demo:**
+- ✅ Represents real security risk
+- ✅ Easy to verify in AWS Console
+- ✅ Shows immediate automated response
+- ✅ Demonstrates infrastructure security enforcement
+- ✅ Clear visual confirmation when rule is removed
 
 ### Manual Drift Detection Trigger
 
-Don't want to wait for the daily schedule?
+Don't want to wait for the automatic schedule (runs every minute)?
 
-1. Go to Actions → "Terraform Drift Detection (Production Only)"
-2. Click "Run workflow" → Run on main branch
-3. Watch it detect and fix drift in real-time
+1. Go to Actions → "Terraform Drift Detection"
+2. Click "Run workflow" → Select branch (main or dev)
+3. Click "Run workflow" button
+4. Watch it detect and fix drift in real-time
+
+**Note:** Drift detection runs automatically every minute, so you'll see results very quickly after making changes!
 
 ---
 
@@ -343,14 +381,14 @@ main branch → prod environment
 dev branch  → dev environment
 ```
 
-### Workflow 2: Drift Detection (`drift_detection.yml` )
+### Workflow 2: Drift Detection (`drift_detection.yml`)
 
 **Triggers:**
-- Daily schedule: 8 AM UTC
-- Manual trigger
-- Push to `main` (optional, immediate check)
+- **Scheduled:** Every 1 minute (automatic)
+- **Manual:** Via GitHub Actions UI
+- **Push:** On push to `main` or `dev` branches
 
-**Only runs on main branch (production)!**
+**Runs on both dev and prod environments!**
 
 **Flow:**
 ```
@@ -658,24 +696,26 @@ terraform destroy
 - Copy ALB DNS, show in browser (if app deployed)
 
 **Minute 5-6: Introduce Drift**
-- AWS Console → ALB → Tags
-- Add `ManualTag=DriftDemo`
-- "This simulates unauthorized manual change"
+- AWS Console → EC2 → Security Groups
+- Find ALB security group (e.g., `dev-alb-sg`)
+- Add dangerous inbound rule: Port 22, Source 0.0.0.0/0
+- "This simulates a critical security violation allowing SSH from anywhere"
 
-**Minute 7-8: Trigger Drift Detection**
-- GitHub Actions → Run drift detection manually
-- Watch it detect drift
-- Show issue being created
+**Minute 7-8: Watch Automatic Detection**
+- Wait ~1 minute (drift detection runs every 1 minute)
+- GitHub Actions → Drift detection workflow triggers automatically
+- Watch it detect the unauthorized security group rule change
+- Show GitHub issue being created with drift details and security alert
 
 **Minute 9: Auto-Remediation**
-- Watch terraform apply run
-- Show Slack notification
-- Refresh AWS Console → Tag is gone
+- Watch terraform apply run automatically
+- Show Slack notification with drift remediation alert
+- Refresh AWS Console → Unauthorized SSH rule is removed
 
 **Minute 10: Wrap Up**
-- Show issue closed
-- Explain daily automated schedule
-- Show destroy workflow for cleanup
+- Show GitHub issue closed automatically
+- Explain 1-minute automated drift detection schedule
+- Show destroy workflow for safe cleanup
 
 ---
 
@@ -1055,7 +1095,7 @@ terraform output >> $GITHUB_STEP_SUMMARY
 ```
 drift-detection (Single Job)
     │
-    ├─ Trigger: Schedule (daily 8am UTC)
+    ├─ Trigger: Schedule (every 1 minute)
     ├─ Trigger: Manual
     ├─ Trigger: Push to main/dev
     │
